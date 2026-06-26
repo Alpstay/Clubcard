@@ -25,7 +25,9 @@
       PRICE_PER_TOKEN_EUR: 0.08,   // prezzo di acquisto di 1 Point in Euro (modificabile da Impostazioni)
       TRANSLATE_URL: "",  // Edge Function DeepL (consigliato): https://<progetto>.supabase.co/functions/v1/translate
       DEEPL_KEY: "",      // alternativa: chiave DeepL diretta (sconsigliata in pagina)
-      CONCIERGE_DB_URL: "https://alpstayconcierge-default-rtdb.europe-west1.firebasedatabase.app"  // Realtime Database del Concierge (sync catalogo)
+      CONCIERGE_DB_URL: "https://alpstayconcierge-default-rtdb.europe-west1.firebasedatabase.app",  // Realtime Database del Concierge (sync catalogo)
+      CLUBCARD_DB_URL: "https://alpstayclubcard-default-rtdb.europe-west1.firebasedatabase.app",  // Realtime Database principale (Clubcard)
+      CLUBCARD_SYNC: "read"   // "off" = solo locale | "read" = catalogo da Firebase | "full" = anche soci/Points (richiede scrittura abilitata)
     };
   </script>
 
@@ -69,6 +71,48 @@
     var STAFF_USER = "alpstay", STAFF_PASS = "admin1234";
     var TOKEN_EUR = 0.04;
     var CONCIERGE_URL = (CFG.CONCIERGE_DB_URL||"https://alpstayconcierge-default-rtdb.europe-west1.firebasedatabase.app");
+    var CLUBCARD_URL = (CFG.CLUBCARD_DB_URL||"");
+    var CLUBCARD_SYNC = (CFG.CLUBCARD_SYNC||"off");
+    var FB_READY=false, FB_PUSH_TIMER=null;
+    function fbBase(){ return String(CLUBCARD_URL||"").replace(/\/+$/,""); }
+    function fbGet(node){ try{ return fetch(fbBase()+"/"+node+".json").then(function(r){ if(!r.ok) throw new Error("HTTP "+r.status+" lettura "+node); return r.json(); }); }catch(e){ return Promise.reject(e); } }
+    function fbWrite(node,data,method){ return fetch(fbBase()+"/"+node+".json",{method:(method||"PUT"),headers:{"Content-Type":"application/json"},body:JSON.stringify(data)}).then(function(r){ if(!r.ok) throw new Error("HTTP "+r.status+" scrittura "+node); return r; }); }
+    function fbApplyCatalog(d,c){ c=c||{};
+      if(c.config){ if(c.config.pointValueEur!=null) d.settings.valueEur=Number(c.config.pointValueEur); if(c.config.pointBuyEur!=null) d.settings.buyEur=Number(c.config.pointBuyEur); }
+      if(c.content&&c.content.legal){ d.legal={terms:c.content.legal.terms||"",privacy:c.content.legal.privacy||""}; }
+      if(c.offers){ var ex=[],pr=[],sh=[]; Object.keys(c.offers).forEach(function(k){ var o=c.offers[k]||{}; var it={id:o.id||k,title:o.title||"",subtitle:o.subtitle||"",description:o.description||"",cost_in_tokens:Number(o.cost)||0,photo:o.photo||"",structures:o.structures||[],is_active:(o.active!==false),tr:o.tr||{},_o:Number(o.order)||0}; var cat=o.category||"experience"; if(cat==="priority")pr.push(it); else if(cat==="shop")sh.push(it); else ex.push(it); }); function so(a){a.sort(function(x,y){return (x._o||0)-(y._o||0);});a.forEach(function(i){delete i._o;});return a;} d.experiences=so(ex); d.priority=so(pr); d.shop=so(sh); }
+      if(c.promos){ var ps=[]; Object.keys(c.promos).forEach(function(k){ var pp=c.promos[k]||{}; ps.push({id:pp.id||k,code:pp.code||"",url:pp.url||"",desc:pp.desc||{it:"",de:"",en:""},is_active:(pp.active!==false),createdAt:pp.createdAt||new Date().toISOString()}); }); d.promos=ps; }
+      return d;
+    }
+    function fbApplyMembers(d,members,staff){ d.users={};
+      function add(rec,role){ if(!rec||!rec.email) return; d.users[String(rec.email).toLowerCase()]={ id:rec.id||("u_"+Math.random().toString(36).slice(2,10)), email:rec.email, full_name:rec.fullName||rec.full_name||"", card_number:rec.cardNumber||rec.card_number||"", role:role||rec.role||"guest", balance:Number(rec.balance)||0, tier:rec.tier||"silver", peak:Number(rec.peak)||0, pin:(rec.pin!=null?rec.pin:null), lastStayAt:rec.lastStayAt||null, transactions:rec.transactions||[] }; }
+      if(members) Object.keys(members).forEach(function(k){ add(members[k],"guest"); });
+      if(staff) Object.keys(staff).forEach(function(k){ add(staff[k],(staff[k]&&staff[k].role)||"admin"); });
+      if(!d.users["admin@alpstay.eu"]) d.users["admin@alpstay.eu"]={id:"u_admin",email:"admin@alpstay.eu",full_name:"Reception Alpstay",card_number:"",role:"admin",balance:0,tier:"silver",peak:0,transactions:[]};
+      return d;
+    }
+    function fbBuildRemote(d){
+      var offers={},ord=0; function ao(arr,cat){ (arr||[]).forEach(function(o){ ord++; offers[o.id]={id:o.id,category:cat,title:o.title||"",subtitle:o.subtitle||"",description:o.description||"",cost:Number(o.cost_in_tokens)||0,photo:o.photo||"",structures:o.structures||[],active:(o.is_active!==false),order:ord,tr:o.tr||{}}; }); }
+      ao(d.experiences,"experience"); ao(d.priority,"priority"); ao(d.shop,"shop");
+      var promos={}; (d.promos||[]).forEach(function(pp,i){ promos[pp.id]={id:pp.id,code:pp.code||"",url:pp.url||"",desc:pp.desc||{},active:(pp.is_active!==false),order:i+1}; });
+      var members={},staff={}; Object.keys(d.users||{}).forEach(function(em){ var u=d.users[em]; if(u.role==="admin"||u.role==="staff"){ staff[u.id]={id:u.id,email:u.email,fullName:u.full_name||"",role:u.role}; } else { members[u.id]={id:u.id,email:u.email,fullName:u.full_name||"",cardNumber:u.card_number||"",role:u.role||"guest",balance:Number(u.balance)||0,tier:u.tier||"silver",peak:Number(u.peak)||0,pin:(u.pin!=null?u.pin:null),lastStayAt:u.lastStayAt||null,transactions:u.transactions||[]}; } });
+      return { config:{pointValueEur:(d.settings&&d.settings.valueEur),pointBuyEur:(d.settings&&d.settings.buyEur)}, content:{legal:{terms:(d.legal&&d.legal.terms)||"",privacy:(d.legal&&d.legal.privacy)||""}}, offers:offers, promos:promos, members:members, staff:staff, counters:{members:Object.keys(members).length,offers:Object.keys(offers).length,promos:Object.keys(promos).length,updatedAt:new Date().toISOString()} };
+    }
+    function fbPush(d){ if(CLUBCARD_SYNC!=="full"||!FB_READY||!fbBase()) return; if(!d||!d.users||!Object.keys(d.users).length) return; if(FB_PUSH_TIMER) clearTimeout(FB_PUSH_TIMER); var snap=JSON.parse(JSON.stringify(d)); FB_PUSH_TIMER=setTimeout(function(){ var r=fbBuildRemote(snap); fbWrite("config",r.config,"PATCH").catch(function(){}); fbWrite("content",r.content,"PATCH").catch(function(){}); fbWrite("offers",r.offers,"PUT").catch(function(){}); fbWrite("promos",r.promos,"PUT").catch(function(){}); fbWrite("members",r.members,"PUT").catch(function(){}); fbWrite("staff",r.staff,"PUT").catch(function(){}); fbWrite("counters",r.counters,"PUT").catch(function(){}); },700); }
+    function fbBoot(){
+      if((CLUBCARD_SYNC!=="read"&&CLUBCARD_SYNC!=="full")||!fbBase()||!isLocal||!API.cloudApply||typeof fetch!=="function") return Promise.resolve(false);
+      var jobs=[ fbGet("config").catch(function(){return null;}), fbGet("offers").catch(function(){return null;}), fbGet("promos").catch(function(){return null;}), fbGet("content").catch(function(){return null;}) ];
+      if(CLUBCARD_SYNC==="full"){ jobs.push(fbGet("members").catch(function(){return null;})); jobs.push(fbGet("staff").catch(function(){return null;})); }
+      return Promise.all(jobs).then(function(res){
+        var cat={config:res[0],offers:res[1],promos:res[2],content:res[3]};
+        var gotCat=!!(cat.config||cat.offers||cat.promos||cat.content);
+        var members=(CLUBCARD_SYNC==="full")?res[4]:null, staff=(CLUBCARD_SYNC==="full")?res[5]:null;
+        var gotMem=!!(members||staff);
+        if(gotCat||gotMem){ API.cloudApply({catalog:gotCat?cat:null, members:members, staff:staff, fullMembers:gotMem}); }
+        if(CLUBCARD_SYNC==="full"&&gotMem) FB_READY=true;
+        return true;
+      }).catch(function(){ return false; });
+    }
     var DEFAULT_TERMS = "I Points sono nominativi: non sono trasferibili ad altri e non sono cumulabili tra pi\u00f9 tessere o card.\nLe esperienze devono essere prenotate con almeno 24 ore di anticipo, salvo disponibilit\u00e0.\nDopo 2 anni consecutivi senza prenotazioni presso Alpstay, l'80% dei Points accumulati viene azzerato.";
     var DEFAULT_PRIVACY = "I dati personali (nome ed email) sono trattati al solo fine di gestire l'iscrizione al programma Alpstay Collection Member, l'accredito dei Points e l'erogazione delle esperienze.\nI dati non sono ceduti a terzi e sono conservati per la durata dell'adesione al programma.\nIn qualsiasi momento puoi richiedere accesso, rettifica o cancellazione dei tuoi dati contattando la reception."
     var IS_CONFIGURED = /^https:\/\/.+/.test(SUPABASE_URL) && SUPABASE_URL.indexOf("INSERISCI")!==0 &&
@@ -167,7 +211,7 @@
     function makeLocalAPI(){
       var KEY="alpstay_db", mem=null;
       function load(){ if(mem) return mem; try{ var r=localStorage.getItem(KEY); if(r){ mem=JSON.parse(r); var gg=mem.users&&mem.users["giulia@alpstay.eu"]; if(gg&&!gg.pin){ gg.pin="1234"; try{ localStorage.setItem(KEY, JSON.stringify(mem)); }catch(e){} } return mem; } }catch(e){} return null; }
-      function save(db){ mem=db; try{ localStorage.setItem(KEY, JSON.stringify(db)); }catch(e){} }
+      function save(db){ mem=db; try{ localStorage.setItem(KEY, JSON.stringify(db)); }catch(e){} try{ if(typeof fbPush==="function") fbPush(db); }catch(e){} }
       function uid(){ return "u_"+Math.random().toString(36).slice(2,10); }
       function cardNo(){ var s=""; for(var i=0;i<16;i++) s+=Math.floor(Math.random()*10); return s; }
       function seed(){
@@ -202,6 +246,7 @@
       return {
         mode:"local",
         reset:function(){ try{ localStorage.removeItem(KEY); }catch(e){} mem=null; seed(); },
+        cloudApply:function(payload){ payload=payload||{}; var d=db(); if(payload.catalog) fbApplyCatalog(d,payload.catalog); if(payload.fullMembers) fbApplyMembers(d,payload.members,payload.staff); save(d); return P(true); },
         getSession:function(){ var d=db(); var u=d.session?d.users[d.session]:null; return P(u?{user:{id:u.id,email:u.email}}:null); },
         signIn:function(email,pw){ var d=db(); email=(email||"").toLowerCase(); var u=d.users[email]; if(!u||u.password!==pw) return P({error:{message:"Credenziali non valide"}}); d.session=email; save(d); return P({}); },
         signUp:function(email,pw,name){ var d=db(); email=(email||"").toLowerCase(); if(d.users[email]) return P({error:{message:"Email gia' registrata"}}); d.users[email]={id:uid(),email:email,password:pw,full_name:name||"",card_number:cardNo(),role:"guest",balance:0,transactions:[]}; d.session=email; save(d); return P({}); },
@@ -1657,7 +1702,7 @@ html,body{width:210mm;height:297mm;background:#fff;color:var(--ink);font-family:
     function init(){
       try{ var pr=new URLSearchParams(location.search).get("purchase"); if(pr==="success"||pr==="cancel"){ PURCHASE_NOTICE=pr; history.replaceState({},"",location.pathname); } }catch(e){}
       if(!isLocal && API.onAuth){ API.onAuth(function(s){ if(s&&s.user){ CURRENT_EMAIL=s.user.email; if(!CURRENT_UID){ viewMode="cliente"; loadClient(s.user.id); } } else { CURRENT_UID=null; showIntro(); } }); }
-      if(API.getSettings){ API.getSettings().then(applySettings).catch(function(){}).then(function(){ refresh(); }); } else { refresh(); }
+      function _go(){ if(API.getSettings){ API.getSettings().then(applySettings).catch(function(){}).then(function(){ refresh(); }); } else { refresh(); } } if(typeof fbBoot==="function"){ fbBoot().then(_go).catch(_go); } else { _go(); }
     }
     window.addEventListener("error",function(e){ setApp('<div class="min-h-screen grid place-items-center px-6"><div class="max-w-md rounded-2xl border border-red-200 bg-red-50 p-5 text-red-800"><div class="font-bold mb-1">Errore</div><div class="text-sm whitespace-pre-wrap">'+esc(e.message||"")+'</div></div></div>'); });
     try{ init(); }catch(e){ setApp("Errore: "+esc(e.message||e)); }
